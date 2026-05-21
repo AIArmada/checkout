@@ -34,6 +34,8 @@ use Illuminate\Contracts\Events\Dispatcher;
 use RuntimeException;
 use Spatie\LaravelPackageTools\Package;
 use Spatie\LaravelPackageTools\PackageServiceProvider;
+use Spatie\WebhookClient\Models\WebhookCall;
+use Spatie\WebhookClient\WebhookClientServiceProvider;
 
 final class CheckoutServiceProvider extends PackageServiceProvider
 {
@@ -44,6 +46,7 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         $package
             ->name('checkout')
             ->hasConfigFile()
+            ->runsMigrations()
             ->discoversMigrations();
 
         // Conditionally register views
@@ -59,6 +62,8 @@ final class CheckoutServiceProvider extends PackageServiceProvider
 
     public function registeringPackage(): void
     {
+        $this->configureSpatieWebhookClient();
+        $this->registerSpatieWebhookClient();
         $this->registerStepRegistry();
         $this->registerPaymentGatewayResolver();
         $this->registerCheckoutService();
@@ -121,7 +126,7 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         $this->app->singleton(function (): PaymentGatewayResolver {
             $resolver = new PaymentGatewayResolver(
                 config('checkout.payment.default_gateway'),
-                config('checkout.payment.gateway_priority', ['cashier', 'cashier-chip', 'chip']),
+                config('checkout.payment.gateway_priority', ['chip', 'cashier-chip', 'cashier']),
             );
 
             $this->registerPaymentProcessors($resolver);
@@ -174,7 +179,9 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         $registry->registerLazy('calculate_pricing', fn () => $this->app->make(CalculatePricingStep::class));
         $registry->registerLazy('calculate_shipping', fn () => $this->app->make(CalculateShippingStep::class));
         $registry->registerLazy('process_payment', fn () => $this->app->make(ProcessPaymentStep::class));
-        $registry->registerLazy('create_order', fn () => $this->app->make(CreateOrderStep::class));
+        $registry->registerLazy('create_order', fn () => new CreateOrderStep(
+            vouchersAdapter: $this->app->make(Integrations\VouchersAdapter::class),
+        ));
         $registry->registerLazy('dispatch_documents', fn () => $this->app->make(DispatchDocumentGenerationStep::class));
     }
 
@@ -186,21 +193,28 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         if ($this->hasInventoryPackage() && config('checkout.integrations.inventory.enabled', true)) {
             // Bind InventoryAdapter so it can be injected into ReserveInventoryStep
             $this->app->singleton(Integrations\InventoryAdapter::class);
-            $registry->register('reserve_inventory', $this->app->make(ReserveInventoryStep::class));
+            $registry->register('reserve_inventory', new ReserveInventoryStep(
+                inventoryAdapter: $this->app->make(Integrations\InventoryAdapter::class),
+            ));
         } else {
             $registry->disable('reserve_inventory');
         }
 
         // Tax integration (optional)
         if ($this->hasTaxPackage() && config('checkout.integrations.tax.enabled', true)) {
-            $registry->register('calculate_tax', $this->app->make(CalculateTaxStep::class));
+            $registry->register('calculate_tax', new CalculateTaxStep(
+                taxAdapter: $this->app->make(Integrations\TaxAdapter::class),
+            ));
         } else {
             $registry->disable('calculate_tax');
         }
 
         // Discounts integration (promotions + vouchers, optional)
         if ($this->hasDiscountPackages() && $this->isDiscountsEnabled()) {
-            $registry->register('apply_discounts', $this->app->make(ApplyDiscountsStep::class));
+            $registry->register('apply_discounts', new ApplyDiscountsStep(
+                promotionsAdapter: $this->app->make(Integrations\PromotionsAdapter::class),
+                vouchersAdapter: $this->app->make(Integrations\VouchersAdapter::class),
+            ));
         } else {
             $registry->disable('apply_discounts');
         }
@@ -220,8 +234,77 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         }
     }
 
+    protected function configureSpatieWebhookClient(): void
+    {
+        if (! class_exists(WebhookCall::class)) {
+            return;
+        }
+
+        $configName = 'checkout.webhook';
+        $configs = config('webhook-client.configs', []);
+
+        if (! is_array($configs)) {
+            $configs = [];
+        }
+
+        $configs = array_values(array_filter($configs, static function (mixed $existingConfig): bool {
+            if (! is_array($existingConfig)) {
+                return false;
+            }
+
+            $processWebhookJob = $existingConfig['process_webhook_job'] ?? null;
+
+            return is_string($processWebhookJob) && $processWebhookJob !== '';
+        }));
+
+        foreach ($configs as $existingConfig) {
+            if (is_array($existingConfig) && ($existingConfig['name'] ?? null) === $configName) {
+                return;
+            }
+        }
+
+        $configs[] = [
+            'name' => $configName,
+            'signing_secret' => '',
+            'signature_header_name' => 'x-signature',
+            'signature_validator' => Webhooks\CheckoutSpatieSignatureValidator::class,
+            'webhook_profile' => Webhooks\CheckoutWebhookProfile::class,
+            'webhook_response' => Webhooks\CheckoutWebhookResponse::class,
+            'webhook_model' => WebhookCall::class,
+            'store_headers' => [
+                'x-signature',
+                'stripe-signature',
+            ],
+            'process_webhook_job' => Webhooks\ProcessCheckoutWebhook::class,
+        ];
+
+        config([
+            'webhook-client.configs' => $configs,
+        ]);
+    }
+
+    protected function registerSpatieWebhookClient(): void
+    {
+        if (! class_exists(WebhookClientServiceProvider::class)) {
+            return;
+        }
+
+        if (method_exists($this->app, 'getProvider') && $this->app->getProvider(WebhookClientServiceProvider::class) instanceof WebhookClientServiceProvider) {
+            return;
+        }
+
+        $this->app->register(WebhookClientServiceProvider::class);
+    }
+
     protected function validatePaymentGatewayConfiguration(): void
     {
+        // Skip validation when the payment step is explicitly disabled (e.g. free-order-only flows).
+        $stepEnabled = config('checkout.steps.enabled.process_payment', true);
+
+        if (! $stepEnabled) {
+            return;
+        }
+
         // Check if at least one payment package exists
         $hasCashier = class_exists(GatewayManager::class);
         $hasCashierChip = class_exists(Cashier::class);

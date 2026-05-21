@@ -93,7 +93,7 @@ final class CalculatePricingStep extends AbstractCheckoutStep
      */
     private function applyPricingRules(CheckoutSession $session, array $pricingData, int $subtotal): array
     {
-        if (! class_exists(PriceCalculatorInterface::class)) {
+        if (! interface_exists(PriceCalculatorInterface::class)) {
             $pricingData['subtotal'] = $subtotal;
 
             return $pricingData;
@@ -111,7 +111,7 @@ final class CalculatePricingStep extends AbstractCheckoutStep
             $quantity = (int) ($item['quantity'] ?? 1);
             $unitPrice = (int) ($item['price'] ?? 0);
 
-            $originalUnitPrice = $unitPrice;
+            $originalUnitPrice = null;
             $discountAmount = 0;
             $discountSource = null;
             $priceListName = null;
@@ -119,7 +119,7 @@ final class CalculatePricingStep extends AbstractCheckoutStep
             $promotionName = null;
             $pricingBreakdown = [];
 
-            $priceable = $this->resolvePriceable($item);
+            $priceable = $this->resolvePriceable($item, $session);
             if ($priceable !== null) {
                 $result = $calculator->calculate($priceable, $quantity, [
                     'customer_id' => $session->customer_id,
@@ -164,7 +164,7 @@ final class CalculatePricingStep extends AbstractCheckoutStep
     /**
      * @param  array<string, mixed>  $item
      */
-    private function resolvePriceable(array $item): ?Priceable
+    private function resolvePriceable(array $item, CheckoutSession $session): ?Priceable
     {
         $associated = $item['associated_model'] ?? null;
 
@@ -189,6 +189,39 @@ final class CalculatePricingStep extends AbstractCheckoutStep
 
         /** @var Model|null $model */
         $model = $class::query()->find((string) $id);
+
+        if ($model === null) {
+            return null;
+        }
+
+        // Defense-in-depth: when checkout owner mode is enabled, reject any model whose
+        // owner tuple does not exactly match the checkout session owner tuple. This blocks
+        // crafted associated_model.class/id payloads from resolving cross-tenant records.
+        if (config('checkout.owner.enabled', false)) {
+            $attributes = $model->getAttributes();
+
+            if (array_key_exists('owner_type', $attributes) && array_key_exists('owner_id', $attributes)) {
+                $modelOwnerType = $model->getAttribute('owner_type');
+                $modelOwnerId = $model->getAttribute('owner_id');
+                $sessionOwnerType = $session->owner_type;
+                $sessionOwnerId = $session->owner_id;
+
+                if (($modelOwnerType === null) !== ($modelOwnerId === null)) {
+                    return null;
+                }
+
+                if (($sessionOwnerType === null) !== ($sessionOwnerId === null)) {
+                    return null;
+                }
+
+                if (
+                    $modelOwnerType !== $sessionOwnerType
+                    || (string) ($modelOwnerId ?? '') !== (string) ($sessionOwnerId ?? '')
+                ) {
+                    return null;
+                }
+            }
+        }
 
         return $model instanceof Priceable ? $model : null;
     }

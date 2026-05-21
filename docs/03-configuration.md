@@ -17,11 +17,11 @@ return [
     |--------------------------------------------------------------------------
     */
     'database' => [
-        'table_prefix' => env('CHECKOUT_TABLE_PREFIX', ''),
+        'table_prefix' => env('CHECKOUT_TABLE_PREFIX', env('COMMERCE_TABLE_PREFIX', '')),
         'tables' => [
             'checkout_sessions' => 'checkout_sessions',
         ],
-        'json_column_type' => env('CHECKOUT_JSON_COLUMN_TYPE', 'json'),
+        'json_column_type' => env('CHECKOUT_JSON_COLUMN_TYPE', env('COMMERCE_JSON_COLUMN_TYPE', 'json')),
     ],
 
     /*
@@ -45,6 +45,15 @@ return [
         'customer' => \AIArmada\Customers\Models\Customer::class,
         'order' => \AIArmada\Orders\Models\Order::class,
     ],
+
+    'transformers' => [
+        'billing' => \AIArmada\Checkout\Transformers\NullSessionDataTransformer::class,
+        'shipping' => \AIArmada\Checkout\Transformers\NullSessionDataTransformer::class,
+    ],
+    'create_order' => [
+        'confirm_payment' => true,
+    ],
+
 
     /*
     |--------------------------------------------------------------------------
@@ -86,6 +95,7 @@ return [
     'owner' => [
         'enabled' => env('CHECKOUT_OWNER_ENABLED', false),
         'include_global' => false,
+        'auto_assign_on_create' => true,
     ],
 
     /*
@@ -134,18 +144,31 @@ return [
     'payment' => [
         'default_gateway' => env('CHECKOUT_DEFAULT_GATEWAY', 'chip'),
         'gateway_priority' => ['chip', 'cashier-chip', 'cashier'],
-        'retry_limit' => env('CHECKOUT_PAYMENT_RETRY_LIMIT', 3),
+        'retry_limit' => 3,
         'gateways' => [
-            'chip' => [
-                'enabled' => env('CHECKOUT_CHIP_ENABLED', true),
-                'config_namespace' => 'chip',
+            'cashier' => [
+                'enabled' => true,
             ],
-            'stripe' => [
-                'enabled' => env('CHECKOUT_STRIPE_ENABLED', false),
-                'config_namespace' => 'cashier',
+            'cashier-chip' => [
+                'enabled' => true,
+            ],
+            'chip' => [
+                'enabled' => true,
             ],
         ],
     ],
+    'response_mode' => 'redirect',
+
+    'views' => [
+        'enabled' => true,
+        'layout' => 'layouts.app',
+        'routes' => [
+            'success' => 'checkout::success',
+            'failure' => 'checkout::failure',
+            'cancel' => 'checkout::cancel',
+        ],
+    ],
+
 
     /*
     |--------------------------------------------------------------------------
@@ -191,7 +214,6 @@ return [
     */
     'webhooks' => [
         'verify_signature' => env('CHECKOUT_WEBHOOK_VERIFY_SIGNATURE', true),
-        'log_payloads' => env('CHECKOUT_WEBHOOK_LOG_PAYLOADS', false),
         'log_channel' => env('CHECKOUT_WEBHOOK_LOG_CHANNEL'),
     ],
 
@@ -263,9 +285,12 @@ Each transformer must implement `AIArmada\Checkout\Contracts\SessionDataTransfor
 | `payment.gateway_priority` | array | `['chip', 'cashier-chip', 'cashier']` | Gateway resolution order |
 | `payment.retry_limit` | int | `3` | Max payment retry attempts |
 
+The `payment.gateways.*.enabled` flags are config constants in the package config (all `true` by default), not environment-driven toggles.
+
 Gateway-specific configuration references the related package configs:
-- **CHIP**: Uses `config('chip.*')` 
-- **Stripe**: Uses `config('cashier.*')`
+- **CHIP** (`chip`): Uses `config('chip.*')`
+- **Cashier CHIP** (`cashier-chip`): Uses `config('cashier-chip.*')`
+- **Cashier** (`cashier`): Uses `config('cashier.*')`
 
 ### Routes
 
@@ -275,6 +300,25 @@ Gateway-specific configuration references the related package configs:
 | `routes.prefix` | string | `checkout` | Route prefix |
 | `routes.callbacks.*` | string | `payment/*` | Payment callback paths |
 | `routes.webhook_prefix` | string | `webhooks` | Webhook route prefix |
+
+### Response Mode and Views
+
+```php
+'response_mode' => 'redirect', // 'redirect' or 'view'
+
+'views' => [
+    'enabled' => true,
+    'layout' => 'layouts.app',
+    'routes' => [
+        'success' => 'checkout::success',
+        'failure' => 'checkout::failure',
+        'cancel' => 'checkout::cancel',
+    ],
+],
+```
+
+- `response_mode='redirect'` redirects users using `redirects.*`.
+- `response_mode='view'` renders checkout package views directly.
 
 ### Redirects
 
@@ -295,9 +339,11 @@ Webhooks are verified using the source gateway's mechanism:
 ```php
 'webhooks' => [
     'verify_signature' => true, // Enforce signature verification
-    'log_payloads' => false,    // Log webhook payloads
+    'log_channel' => null,      // Optional dedicated log channel
 ],
 ```
+
+`webhooks.verify_signature` should remain enabled in production. If disabled, checkout rejects webhook requests in production environments.
 
 ### Integration Settings
 
@@ -330,6 +376,7 @@ Enable multi-tenancy:
 'owner' => [
     'enabled' => true,
     'include_global' => false,
+    'auto_assign_on_create' => true,
 ],
 ```
 
@@ -341,7 +388,6 @@ CHECKOUT_CURRENCY=MYR
 
 # Payment gateway
 CHECKOUT_DEFAULT_GATEWAY=chip
-CHECKOUT_PAYMENT_RETRY_LIMIT=3
 
 # Routes
 CHECKOUT_ROUTES_ENABLED=true
@@ -353,7 +399,7 @@ CHECKOUT_REDIRECT_FAILURE=/checkout/failed
 
 # Webhooks
 CHECKOUT_WEBHOOK_VERIFY_SIGNATURE=true
-CHECKOUT_WEBHOOK_LOG_PAYLOADS=false
+CHECKOUT_WEBHOOK_LOG_CHANNEL=
 
 # Multi-tenancy
 CHECKOUT_OWNER_ENABLED=false

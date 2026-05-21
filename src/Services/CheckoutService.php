@@ -12,6 +12,7 @@ use AIArmada\Checkout\Contracts\CheckoutStepRegistryInterface;
 use AIArmada\Checkout\Contracts\PaymentGatewayResolverInterface;
 use AIArmada\Checkout\Contracts\SessionDataTransformerInterface;
 use AIArmada\Checkout\Data\CheckoutResult;
+use AIArmada\Checkout\Data\PaymentResult;
 use AIArmada\Checkout\Data\StepResult;
 use AIArmada\Checkout\Enums\PaymentStatus;
 use AIArmada\Checkout\Enums\StepStatus;
@@ -32,8 +33,11 @@ use AIArmada\Checkout\States\PaymentFailed;
 use AIArmada\Checkout\States\Pending;
 use AIArmada\Checkout\States\Processing;
 use AIArmada\Checkout\Transformers\NullSessionDataTransformer;
+use AIArmada\CommerceSupport\Support\OwnerContext;
 use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Throwable;
 
@@ -93,54 +97,56 @@ final class CheckoutService implements CheckoutServiceInterface
             throw InvalidCheckoutStateException::cannotModify($session->id, $session->status->name());
         }
 
-        $this->transformSessionData($session);
+        return $this->withSessionOwnerContext($session, function () use ($session): CheckoutResult {
+            $this->transformSessionData($session);
 
-        if (! $session->status->is(Processing::class)) {
-            $session->status->transitionTo(Processing::class);
-        }
+            if (! $session->status->is(Processing::class)) {
+                $session->transitionStatus(Processing::class);
+            }
 
-        try {
-            return DB::transaction(function () use ($session) {
-                foreach ($this->stepRegistry->getOrderedSteps() as $step) {
-                    $stepState = $session->getStepState($step->getIdentifier());
+            try {
+                return DB::transaction(function () use ($session) {
+                    foreach ($this->stepRegistry->getOrderedSteps() as $step) {
+                        $stepState = $session->getStepState($step->getIdentifier());
 
-                    // Skip already completed steps
-                    if ($stepState === StepStatus::Completed || $stepState === StepStatus::Skipped) {
-                        continue;
+                        // Skip already completed steps
+                        if ($stepState === StepStatus::Completed || $stepState === StepStatus::Skipped) {
+                            continue;
+                        }
+
+                        // Check if step can be skipped
+                        if ($step->canSkip($session)) {
+                            $session->setStepState($step->getIdentifier(), StepStatus::Skipped);
+
+                            continue;
+                        }
+
+                        // Process the step
+                        $result = $this->processStepInternal($session, $step);
+
+                        if (! $result->isSuccessful()) {
+                            return CheckoutResult::failed($session, $result->message ?? 'Step failed', $result->errors);
+                        }
+
+                        // Check for payment redirect
+                        if ($step->getIdentifier() === 'process_payment' && $session->payment_redirect_url !== null) {
+                            return CheckoutResult::awaitingPayment($session, $session->payment_redirect_url);
+                        }
                     }
 
-                    // Check if step can be skipped
-                    if ($step->canSkip($session)) {
-                        $session->setStepState($step->getIdentifier(), StepStatus::Skipped);
-
-                        continue;
+                    if (! $session->status->is(Completed::class)) {
+                        $session->transitionStatus(Completed::class);
                     }
+                    $this->events->dispatch(new CheckoutCompleted($session));
 
-                    // Process the step
-                    $result = $this->processStepInternal($session, $step);
+                    return CheckoutResult::success($session);
+                });
+            } catch (Throwable $e) {
+                $this->handleCheckoutFailure($session, $e);
 
-                    if (! $result->isSuccessful()) {
-                        return CheckoutResult::failed($session, $result->message ?? 'Step failed', $result->errors);
-                    }
-
-                    // Check for payment redirect
-                    if ($step->getIdentifier() === 'process_payment' && $session->payment_redirect_url !== null) {
-                        return CheckoutResult::awaitingPayment($session, $session->payment_redirect_url);
-                    }
-                }
-
-                if (! $session->status->is(Completed::class)) {
-                    $session->status->transitionTo(Completed::class);
-                }
-                $this->events->dispatch(new CheckoutCompleted($session));
-
-                return CheckoutResult::success($session);
-            });
-        } catch (Throwable $e) {
-            $this->handleCheckoutFailure($session, $e);
-
-            throw $e;
-        }
+                throw $e;
+            }
+        });
     }
 
     public function processStep(CheckoutSession $session, string $stepName): CheckoutSession
@@ -155,11 +161,13 @@ final class CheckoutService implements CheckoutServiceInterface
             throw CheckoutStepException::stepNotFound($stepName);
         }
 
-        $this->transformSessionData($session);
+        return $this->withSessionOwnerContext($session, function () use ($session, $step): CheckoutSession {
+            $this->transformSessionData($session);
 
-        $this->processStepInternal($session, $step);
+            $this->processStepInternal($session, $step);
 
-        return $session->fresh();
+            return $session->fresh();
+        });
     }
 
     public function retryPayment(CheckoutSession $session): CheckoutResult
@@ -173,29 +181,34 @@ final class CheckoutService implements CheckoutServiceInterface
             throw PaymentException::retryLimitExceeded($session->payment_attempts, $retryLimit);
         }
 
-        // Reset payment step state
-        $session->setStepState('process_payment', StepStatus::Pending);
-        $session->update(['payment_attempts' => $session->payment_attempts + 1]);
-        $session->status->transitionTo(Processing::class);
+        return $this->withSessionOwnerContext($session, function () use ($session): CheckoutResult {
+            // Reset payment step state
+            $session->setStepState('process_payment', StepStatus::Pending);
+            $session->update([
+                'payment_redirect_url' => null,
+                'error_message' => null,
+            ]);
+            $session->transitionStatus(Processing::class);
 
-        // Re-process from payment step
-        $paymentStep = $this->stepRegistry->get('process_payment');
-        if ($paymentStep === null) {
-            throw CheckoutStepException::stepNotFound('process_payment');
-        }
+            // Re-process from payment step
+            $paymentStep = $this->stepRegistry->get('process_payment');
+            if ($paymentStep === null) {
+                throw CheckoutStepException::stepNotFound('process_payment');
+            }
 
-        $result = $this->processStepInternal($session, $paymentStep);
+            $result = $this->processStepInternal($session, $paymentStep);
 
-        if ($result->isSuccessful()) {
-            // Continue with remaining steps
-            return $this->continueFromStep($session, 'process_payment');
-        }
+            if ($session->payment_redirect_url !== null) {
+                return CheckoutResult::awaitingPayment($session, $session->payment_redirect_url);
+            }
 
-        if ($session->payment_redirect_url !== null) {
-            return CheckoutResult::awaitingPayment($session, $session->payment_redirect_url);
-        }
+            if ($result->isSuccessful()) {
+                // Continue with remaining steps
+                return $this->continueFromStep($session, 'process_payment');
+            }
 
-        return CheckoutResult::failed($session, $result->message ?? 'Payment failed', $result->errors);
+            return CheckoutResult::failed($session, $result->message ?? 'Payment failed', $result->errors);
+        });
     }
 
     public function cancelCheckout(CheckoutSession $session): CheckoutSession
@@ -204,14 +217,16 @@ final class CheckoutService implements CheckoutServiceInterface
             throw InvalidCheckoutStateException::cannotCancel($session->id, $session->status->name());
         }
 
-        // Rollback completed steps in reverse order
-        $this->rollbackCompletedSteps($session);
+        return $this->withSessionOwnerContext($session, function () use ($session): CheckoutSession {
+            // Rollback completed steps in reverse order
+            $this->rollbackCompletedSteps($session);
 
-        $session->status->transitionTo(Cancelled::class);
+            $session->transitionStatus(Cancelled::class);
 
-        $this->events->dispatch(new CheckoutCancelled($session));
+            $this->events->dispatch(new CheckoutCancelled($session));
 
-        return $session->fresh();
+            return $session->fresh();
+        });
     }
 
     /**
@@ -222,31 +237,35 @@ final class CheckoutService implements CheckoutServiceInterface
         string $callbackType,
         array $payload = [],
     ): CheckoutResult {
-        // Handle cancellation
-        if ($callbackType === 'cancel') {
-            if ($session->status->canCancel()) {
-                $session->status->transitionTo(Cancelled::class);
-                $this->events->dispatch(new CheckoutCancelled($session));
+        return $this->withSessionOwnerContext($session, function () use ($session, $callbackType, $payload): CheckoutResult {
+            // Handle cancellation
+            if ($callbackType === 'cancel') {
+                if ($session->status->canCancel()) {
+                    $this->rollbackCompletedSteps($session);
+                    $session->transitionStatus(Cancelled::class);
+                    $this->events->dispatch(new CheckoutCancelled($session));
+                }
+
+                return CheckoutResult::failed($session, 'Payment was cancelled');
             }
 
-            return CheckoutResult::failed($session, 'Payment was cancelled');
-        }
+            // Handle failure
+            if ($callbackType === 'failure') {
+                $this->rollbackCompletedSteps($session);
+                $session->transitionStatus(PaymentFailed::class);
+                $session->update(['error_message' => 'Payment failed at gateway']);
+                $this->events->dispatch(new CheckoutFailed($session, 'Payment failed'));
 
-        // Handle failure
-        if ($callbackType === 'failure') {
-            $session->status->transitionTo(PaymentFailed::class);
-            $session->update(['error_message' => 'Payment failed at gateway']);
-            $this->events->dispatch(new CheckoutFailed($session, 'Payment failed'));
+                return CheckoutResult::failed($session, 'Payment failed');
+            }
 
-            return CheckoutResult::failed($session, 'Payment failed');
-        }
+            // Handle success - verify payment and complete checkout
+            if ($callbackType === 'success') {
+                return $this->verifyAndCompletePayment($session, $payload);
+            }
 
-        // Handle success - verify payment and complete checkout
-        if ($callbackType === 'success') {
-            return $this->verifyAndCompletePayment($session, $payload);
-        }
-
-        return CheckoutResult::failed($session, 'Unknown callback type');
+            return CheckoutResult::failed($session, 'Unknown callback type');
+        });
     }
 
     public function getCurrentStep(CheckoutSession $session): ?string
@@ -405,7 +424,7 @@ final class CheckoutService implements CheckoutServiceInterface
         }
 
         if (! $session->status->is(Completed::class)) {
-            $session->status->transitionTo(Completed::class);
+            $session->transitionStatus(Completed::class);
         }
         $this->events->dispatch(new CheckoutCompleted($session));
 
@@ -428,11 +447,25 @@ final class CheckoutService implements CheckoutServiceInterface
 
     private function handleCheckoutFailure(CheckoutSession $session, Throwable $e): void
     {
+        // Release external state (inventory reservations, etc.) that the DB transaction
+        // rollback cannot undo. The in-memory session model still carries the step-state
+        // changes that were fill()ed during the transaction, so the loop correctly
+        // identifies which steps completed before the exception.
+        $this->rollbackCompletedSteps($session);
+
         if (! $session->status->isTerminal() && ! $session->status->is(PaymentFailed::class)) {
-            $session->status->transitionTo(PaymentFailed::class);
+            $session->transitionStatus(PaymentFailed::class);
         }
 
-        $session->update(['error_message' => $e->getMessage()]);
+        // Log the full exception for diagnostics; persist only a sanitized message to avoid
+        // leaking internal paths, SQL fragments, or stack details into the checkout_sessions table
+        // (and onward to views via BuildCheckoutSessionViewData).
+        Log::error('Checkout failure', [
+            'session_id' => $session->getKey(),
+            'exception' => $e,
+        ]);
+
+        $session->update(['error_message' => 'An error occurred during checkout. Please try again.']);
 
         $this->events->dispatch(new CheckoutFailed($session, $e->getMessage()));
     }
@@ -442,28 +475,53 @@ final class CheckoutService implements CheckoutServiceInterface
      */
     private function verifyAndCompletePayment(CheckoutSession $session, array $payload): CheckoutResult
     {
-        // If webhook payload provided, use it; otherwise verify with gateway
+        // If webhook payload provided, use the gateway processor; otherwise verify with gateway lookup.
         $paymentVerified = false;
+        $paymentResult = null;
 
-        if (! empty($payload)) {
-            // Trust webhook payload - gateway has already verified
-            $status = $payload['status'] ?? $payload['data']['object']['status'] ?? null;
-            $paymentVerified = in_array($status, ['paid', 'completed', 'succeeded', 'complete'], true);
-        } elseif ($this->paymentResolver !== null && $session->payment_id !== null) {
-            // Verify payment status with gateway
+        if (! empty($payload) && $this->paymentResolver !== null) {
             $gateway = $session->selected_payment_gateway;
             $processor = $this->paymentResolver->resolve($gateway);
-            $result = $processor->checkStatus($session->payment_id);
+            $paymentResult = $processor->handleCallback($payload);
+        } elseif (! empty($payload)) {
+            $status = $payload['status'] ?? $payload['data']['object']['status'] ?? null;
 
-            $paymentVerified = $result->status === PaymentStatus::Completed;
+            $paymentResult = match ($status) {
+                'paid', 'completed', 'succeeded', 'complete' => PaymentResult::success($session->payment_id ?? 'unknown'),
+                'failed', 'error', 'payment_failed' => PaymentResult::failed('Payment failed', paymentId: $session->payment_id),
+                'cancelled', 'canceled', 'expired' => new PaymentResult(
+                    status: PaymentStatus::Cancelled,
+                    paymentId: $session->payment_id,
+                    gatewayResponse: $payload,
+                ),
+                default => new PaymentResult(
+                    status: PaymentStatus::Processing,
+                    paymentId: $session->payment_id,
+                    gatewayResponse: $payload,
+                ),
+            };
+        } elseif ($this->paymentResolver !== null && $session->payment_id !== null) {
+            $gateway = $session->selected_payment_gateway;
+            $processor = $this->paymentResolver->resolve($gateway);
+            $paymentResult = $processor->checkStatus($session->payment_id);
+        }
 
-            // Update payment data with verification result - update both 'status' and 'verification_status'
-            // so CreateOrderStep validation passes
+        if ($paymentResult !== null) {
+            $paymentVerified = $paymentResult->status === PaymentStatus::Completed;
+
             $session->update([
+                'payment_id' => $paymentResult->paymentId ?? $session->payment_id,
                 'payment_data' => array_merge($session->payment_data ?? [], [
-                    'status' => $result->status->value,
+                    'status' => $paymentResult->status->value,
+                    'verification_status' => $paymentResult->status->value,
                     'verified_at' => now()->toIso8601String(),
-                    'verification_status' => $result->status->value,
+                    'payment_id' => $paymentResult->paymentId ?? $session->payment_id,
+                    'transaction_id' => $paymentResult->transactionId ?? ($session->payment_data['transaction_id'] ?? null),
+                    'amount' => $paymentResult->amount ?? ($session->payment_data['amount'] ?? null),
+                    'currency' => $paymentResult->currency ?? ($session->payment_data['currency'] ?? $session->currency),
+                    'gateway_response' => $paymentResult->gatewayResponse !== []
+                        ? $paymentResult->gatewayResponse
+                        : ($session->payment_data['gateway_response'] ?? null),
                 ]),
             ]);
         }
@@ -477,7 +535,7 @@ final class CheckoutService implements CheckoutServiceInterface
 
         // Payment confirmed - mark payment step complete and continue
         $session->setStepState('process_payment', StepStatus::Completed);
-        $session->status->transitionTo(Processing::class);
+        $session->transitionStatus(Processing::class);
         $session->update(['payment_redirect_url' => null]); // Clear redirect URL
 
         // Continue with remaining steps (create_order, etc.)
@@ -529,5 +587,29 @@ final class CheckoutService implements CheckoutServiceInterface
             session: $session,
             paymentData: is_array($paymentData) ? $paymentData : [],
         ));
+    }
+
+    /**
+     * Execute a callback within the session's owner context.
+     *
+     * When checkout owner mode is enabled, operations on owned sessions must run
+     * within the correct owner context to satisfy HasOwner save guards. This helper
+     * resolves the session owner and wraps the callback accordingly.
+     *
+     * @template TReturn
+     *
+     * @param  callable(): TReturn  $callback
+     * @return TReturn
+     */
+    private function withSessionOwnerContext(CheckoutSession $session, callable $callback): mixed
+    {
+        if (! config('checkout.owner.enabled', false)) {
+            return $callback();
+        }
+
+        /** @var Model|null $owner */
+        $owner = $session->hasOwner() ? $session->owner : null;
+
+        return OwnerContext::withOwner($owner, $callback);
     }
 }

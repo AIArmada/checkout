@@ -11,7 +11,7 @@ return new class extends Migration
     public function up(): void
     {
         $tableName = $this->getTableName();
-        $jsonType = config('checkout.database.json_column_type', 'json');
+        $jsonType = config('checkout.database.json_column_type', commerce_json_column_type('checkout', 'json'));
 
         Schema::create($tableName, function (Blueprint $table) use ($jsonType): void {
             $table->uuid('id')->primary();
@@ -69,11 +69,6 @@ return new class extends Migration
             $table->index(['status', 'created_at']);
             $table->index(['customer_id', 'status']);
         });
-    }
-
-    public function down(): void
-    {
-        Schema::dropIfExists($this->getTableName());
     }
 
     private function getTableName(): string

@@ -20,9 +20,17 @@ Validates the cart before checkout:
 
 Resolves customer information:
 
-- Finds or creates customer record
-- Associates customer with session
-- Validates customer eligibility
+- Resolves existing customer or billable subjects before payment
+- Associates any existing subject with the checkout session
+- Leaves direct-capable guest flows side-effect free before payment
+
+### PersistCustomerStep
+
+Persists customer information after payment succeeds:
+
+- Creates or syncs the customer record from checkout payload data
+- Merges or promotes guest customers when an authenticated actor is known
+- Updates the checkout session before `CreateOrderStep` runs
 
 ### CalculatePricingStep
 
@@ -63,6 +71,7 @@ Reserves inventory for items:
 - Creates stock reservations
 - Sets reservation expiry
 - Handles reservation failures
+- Runs before `process_payment` by default and moves to the start of the post-payment phase when `integrations.inventory.reserve_before_payment` is `false`
 
 ### ProcessPaymentStep
 
@@ -214,7 +223,7 @@ public function dependencies(): array
 }
 ```
 
-The registry ensures dependencies execute before the step.
+Checkout validates dependencies before executing a step, but the configured step order still determines the actual sequence. For the built-in inventory step, prefer `integrations.inventory.reserve_before_payment` over manually swapping `reserve_inventory` and `process_payment` in `steps.order`.
 
 ## Conditional Execution
 

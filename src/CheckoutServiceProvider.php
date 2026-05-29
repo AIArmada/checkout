@@ -19,6 +19,7 @@ use AIArmada\Checkout\Steps\CalculateShippingStep;
 use AIArmada\Checkout\Steps\CalculateTaxStep;
 use AIArmada\Checkout\Steps\CreateOrderStep;
 use AIArmada\Checkout\Steps\DispatchDocumentGenerationStep;
+use AIArmada\Checkout\Steps\PersistCustomerStep;
 use AIArmada\Checkout\Steps\ProcessPaymentStep;
 use AIArmada\Checkout\Steps\ReserveInventoryStep;
 use AIArmada\Checkout\Steps\ResolveCustomerStep;
@@ -180,6 +181,7 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         $registry->registerLazy('calculate_pricing', fn () => $this->app->make(CalculatePricingStep::class));
         $registry->registerLazy('calculate_shipping', fn () => $this->app->make(CalculateShippingStep::class));
         $registry->registerLazy('process_payment', fn () => $this->app->make(ProcessPaymentStep::class));
+        $registry->registerLazy('persist_customer', fn () => $this->app->make(PersistCustomerStep::class));
         $registry->registerLazy('create_order', fn () => new CreateOrderStep(
             vouchersAdapter: $this->app->make(Integrations\VouchersAdapter::class),
         ));
@@ -196,6 +198,7 @@ final class CheckoutServiceProvider extends PackageServiceProvider
             $this->app->singleton(Integrations\InventoryAdapter::class);
             $registry->register('reserve_inventory', new ReserveInventoryStep(
                 inventoryAdapter: $this->app->make(Integrations\InventoryAdapter::class),
+                stepRegistry: $registry,
             ));
         } else {
             $registry->disable('reserve_inventory');
@@ -221,6 +224,62 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         }
 
         $this->registerChipIntegration();
+        $this->normalizeInventoryStepOrder();
+    }
+
+    protected function normalizeInventoryStepOrder(): void
+    {
+        $registry = $this->app->make(CheckoutStepRegistryInterface::class);
+
+        if (! $registry->has('process_payment') || ! $registry->has('reserve_inventory')) {
+            return;
+        }
+
+        if (! $registry->isEnabled('process_payment') || ! $registry->isEnabled('reserve_inventory')) {
+            return;
+        }
+
+        $configuredOrder = method_exists($registry, 'getOrder')
+            ? $registry->getOrder()
+            : array_map(
+                static fn (Contracts\CheckoutStepInterface $step): string => $step->getIdentifier(),
+                $registry->getOrderedSteps(),
+            );
+
+        if (! is_array($configuredOrder) || $configuredOrder === []) {
+            return;
+        }
+
+        $registry->setOrder($this->resolveInventoryStepOrder($configuredOrder));
+    }
+
+    /**
+     * @param  array<int, mixed>  $configuredOrder
+     * @return array<string>
+     */
+    protected function resolveInventoryStepOrder(array $configuredOrder): array
+    {
+        if (! in_array('reserve_inventory', $configuredOrder, true)) {
+            return array_values(array_filter($configuredOrder, 'is_string'));
+        }
+
+        $order = array_values(array_filter(
+            $configuredOrder,
+            static fn (mixed $identifier): bool => is_string($identifier) && $identifier !== 'reserve_inventory',
+        ));
+
+        $processPaymentPosition = array_search('process_payment', $order, true);
+
+        if ($processPaymentPosition === false) {
+            return array_values(array_filter($configuredOrder, 'is_string'));
+        }
+
+        $reserveBeforePayment = config('checkout.integrations.inventory.reserve_before_payment', true);
+        $inventoryPosition = $reserveBeforePayment ? $processPaymentPosition : $processPaymentPosition + 1;
+
+        array_splice($order, $inventoryPosition, 0, ['reserve_inventory']);
+
+        return $order;
     }
 
     protected function validateOwnerConfiguration(): void

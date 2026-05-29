@@ -70,6 +70,7 @@ return [
             'calculate_tax' => true,
             'reserve_inventory' => true,
             'process_payment' => true,
+            'persist_customer' => true,
             'create_order' => true,
             'dispatch_documents' => true,
         ],
@@ -82,6 +83,7 @@ return [
             'calculate_tax',
             'reserve_inventory',
             'process_payment',
+            'persist_customer',
             'create_order',
             'dispatch_documents',
         ],
@@ -123,7 +125,7 @@ return [
         'inventory' => [
             'enabled' => true,
             'validate_stock' => true,
-            'reserve_before_payment' => true,
+            'reserve_before_payment' => true, // True keeps reserve_inventory before process_payment; false runs it first in the post-payment phase
             'release_on_failure' => true,
             'reservation_ttl' => 60 * 15, // 15 minutes
         ],

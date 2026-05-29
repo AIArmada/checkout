@@ -70,6 +70,7 @@ return [
             'calculate_tax' => true,
             'reserve_inventory' => true,
             'process_payment' => true,
+            'persist_customer' => true,
             'create_order' => true,
             'dispatch_documents' => true,
         ],
@@ -82,6 +83,7 @@ return [
             'calculate_tax',
             'reserve_inventory',
             'process_payment',
+            'persist_customer',
             'create_order',
             'dispatch_documents',
         ],
@@ -282,6 +284,16 @@ Transform billing/shipping data before checkout steps use it:
 
 Each transformer must implement `AIArmada\Checkout\Contracts\SessionDataTransformerInterface`.
 
+### Checkout Steps
+
+The default checkout pipeline now persists guest/direct-capable customers only after payment succeeds.
+
+The configured `steps.order` above is the default sequence when `integrations.inventory.reserve_before_payment` is `true`. When that flag is `false`, checkout shifts `reserve_inventory` to the start of the post-payment phase so the effective sequence becomes `process_payment -> reserve_inventory -> persist_customer -> create_order`.
+
+- `resolve_customer` stays in the pre-payment phase and only resolves existing customer or billable subjects for guest/direct-capable flows.
+- `persist_customer` runs in the post-payment phase to create or sync the `Customer` record from checkout payload data once payment is complete.
+- `cashier` keeps its pre-payment persisted-model requirement because it needs a chargeable billable subject before the payment can be created.
+
 ### Payment Settings
 
 | Key | Type | Default | Description |
@@ -381,6 +393,9 @@ Control which integrations are active:
     'chip' => ['enabled' => true],
 ],
 ```
+
+- When `integrations.inventory.reserve_before_payment` is `true`, checkout keeps `reserve_inventory` before `process_payment`.
+- When it is `false`, checkout starts the post-payment phase with `reserve_inventory` before it persists the customer and creates the order.
 
 ### Owner Settings
 

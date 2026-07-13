@@ -101,21 +101,31 @@ The action:
 
 ### Step-by-Step Processing
 
-Process individual steps for more control:
+Run the full checkout flow through the configured steps:
 
 ```php
-// Get current step
-$currentStep = Checkout::getCurrentStep($session);
+// Process all steps
+$result = Checkout::processCheckout($session);
 
-// Process a specific step
-$session = Checkout::processStep($session, 'validate_cart');
-$session = Checkout::processStep($session, 'calculate_pricing');
+if ($result->requiresRedirect()) {
+    // Payment redirect required
+    return redirect($result->redirectUrl);
+}
 
-// Check if can proceed
-if (Checkout::canProceed($session)) {
-    $session = Checkout::processStep($session, 'process_payment');
+if ($result->success) {
+    // Checkout completed
+    $orderId = $result->orderId;
 }
 ```
+
+### Checking Step State
+
+The session model exposes current step state:
+
+```php
+$session->current_step;     // Current step name
+```
+Access step data and statuses directly on the session model after `processCheckout()` returns a `CheckoutResult`.
 
 ## Working with Sessions
 
@@ -451,3 +461,6 @@ try {
 | `InvalidCheckoutStateException::emptyCart` | Cart has no items | Add items to cart |
 | `PaymentException::paymentFailed` | Payment declined | Retry with different method |
 | `InventoryException::insufficientStock` | Item out of stock | Update quantities |
+| `InventoryException::reservationFailed` | Reservation error | Check stock availability |
+| `InventoryException::referenceNotFound` | Missing reservation group | Verify checkout session state |
+| `InventoryException::releaseFailed` | Release error | Check inventory state |

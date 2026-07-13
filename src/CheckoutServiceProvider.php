@@ -6,13 +6,16 @@ namespace AIArmada\Checkout;
 
 use AIArmada\Cashier\GatewayManager;
 use AIArmada\CashierChip\Billing\Cashier;
+use AIArmada\Checkout\Actions\CheckoutFinalizer;
 use AIArmada\Checkout\Contracts\CheckoutServiceInterface;
 use AIArmada\Checkout\Contracts\CheckoutStepRegistryInterface;
 use AIArmada\Checkout\Contracts\PaymentGatewayResolverInterface;
+use AIArmada\Checkout\Contracts\StepContributor;
 use AIArmada\Checkout\Exceptions\MissingPaymentGatewayException;
 use AIArmada\Checkout\Services\CheckoutService;
 use AIArmada\Checkout\Services\CheckoutStepRegistry;
 use AIArmada\Checkout\Services\PaymentGatewayResolver;
+use AIArmada\Checkout\Services\StepExecutor;
 use AIArmada\Checkout\Steps\CalculatePricingStep;
 use AIArmada\Checkout\Steps\CalculateShippingStep;
 use AIArmada\Checkout\Steps\CreateOrderStep;
@@ -76,6 +79,9 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         $this->validatePaymentGatewayConfiguration();
         $this->registerDefaultSteps();
         $this->registerOptionalIntegrations();
+
+        // Defer freeze until after all providers have booted and contributed steps.
+        $this->app->booted(fn () => $this->freezeStepRegistry());
     }
 
     protected function validateStepConfiguration(): void
@@ -152,6 +158,8 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         $this->app->singleton(CheckoutService::class, fn ($app) => new CheckoutService(
             stepRegistry: $app->make(CheckoutStepRegistryInterface::class),
             events: $app->make(Dispatcher::class),
+            stepExecutor: $app->make(StepExecutor::class),
+            finalizer: $app->make(CheckoutFinalizer::class),
             paymentResolver: $app->make(PaymentGatewayResolverInterface::class),
         ));
 
@@ -161,7 +169,7 @@ final class CheckoutServiceProvider extends PackageServiceProvider
 
     protected function registerDefaultSteps(): void
     {
-        $registry = $this->app->make(CheckoutStepRegistryInterface::class);
+        $registry = $this->app->make(CheckoutStepRegistry::class);
 
         $registry->registerLazy('validate_cart', fn () => $this->app->make(ValidateCartStep::class));
         $registry->registerLazy('resolve_customer', fn () => $this->app->make(ResolveCustomerStep::class));
@@ -169,15 +177,13 @@ final class CheckoutServiceProvider extends PackageServiceProvider
         $registry->registerLazy('calculate_shipping', fn () => $this->app->make(CalculateShippingStep::class));
         $registry->registerLazy('process_payment', fn () => $this->app->make(ProcessPaymentStep::class));
         $registry->registerLazy('persist_customer', fn () => $this->app->make(PersistCustomerStep::class));
-        $registry->registerLazy('create_order', fn () => new CreateOrderStep(
-            vouchersAdapter: $this->app->make(Integrations\VouchersAdapter::class),
-        ));
+        $registry->registerLazy('create_order', fn () => $this->app->make(CreateOrderStep::class));
         $registry->registerLazy('dispatch_documents', fn () => $this->app->make(DispatchDocumentGenerationStep::class));
     }
 
     protected function registerOptionalIntegrations(): void
     {
-        $registry = $this->app->make(CheckoutStepRegistryInterface::class);
+        $registry = $this->app->make(CheckoutStepRegistry::class);
 
         app(RegisterCheckoutOptionalSteps::class)->register($registry);
 
@@ -287,5 +293,20 @@ final class CheckoutServiceProvider extends PackageServiceProvider
     {
         $registrar = new ChipIntegrationRegistrar;
         $registrar->register();
+    }
+
+    protected function freezeStepRegistry(): void
+    {
+        $registry = $this->app->make(CheckoutStepRegistry::class);
+
+        foreach ($this->app->tagged('checkout.steps') as $contributor) {
+            if ($contributor instanceof StepContributor) {
+                foreach ($contributor->steps() as $identifier => $factory) {
+                    $registry->registerLazy($identifier, $factory);
+                }
+            }
+        }
+
+        $registry->freeze();
     }
 }

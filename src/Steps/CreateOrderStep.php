@@ -4,17 +4,9 @@ declare(strict_types=1);
 
 namespace AIArmada\Checkout\Steps;
 
-use AIArmada\Cart\Contracts\CartManagerInterface;
-use AIArmada\Checkout\Actions\FinalizeCheckoutSession;
 use AIArmada\Checkout\Data\StepResult;
 use AIArmada\Checkout\Enums\PaymentStatus;
-use AIArmada\Checkout\Integrations\InventoryAdapter;
-use AIArmada\Checkout\Integrations\VouchersAdapter;
 use AIArmada\Checkout\Models\CheckoutSession;
-use AIArmada\Checkout\States\Completed;
-use AIArmada\Checkout\States\Pending;
-use AIArmada\Checkout\States\Processing;
-use AIArmada\Inventory\InventoryServiceProvider;
 use AIArmada\Orders\Contracts\OrderServiceInterface;
 use AIArmada\Orders\Models\Order;
 use Illuminate\Support\Facades\Log;
@@ -22,10 +14,6 @@ use Throwable;
 
 final class CreateOrderStep extends AbstractCheckoutStep
 {
-    public function __construct(
-        private readonly ?VouchersAdapter $vouchersAdapter = null,
-    ) {}
-
     public function getIdentifier(): string
     {
         return 'create_order';
@@ -104,6 +92,8 @@ final class CreateOrderStep extends AbstractCheckoutStep
                 items: $items,
                 billingAddress: $billingData ?: null,
                 shippingAddress: $shippingData ?: null,
+                intakeSource: 'checkout',
+                intakeId: $session->getKey(),
             );
 
             // Persist order_id immediately — before payment confirmation — so retries reuse this order
@@ -121,36 +111,6 @@ final class CreateOrderStep extends AbstractCheckoutStep
             if (! $paymentWasConfirmed) {
                 return $this->failed('Payment confirmation failed', [
                     'payment' => 'The order was created but payment could not be confirmed. Retry payment confirmation before completing checkout.',
-                ]);
-            }
-        }
-
-        $session->update(['completed_at' => now()]);
-
-        $this->redeemAppliedVouchers($session, $order->id);
-
-        if ($session->status->is(Pending::class)) {
-            $session->transitionStatus(Processing::class);
-        }
-
-        // Only transition to Completed if not already in that state
-        if (! $session->status->is(Completed::class)) {
-            $session->transitionStatus(Completed::class);
-        }
-
-        if ($this->shouldCommitInventoryReservations($isFreeOrder, $paymentConfirmationEnabled, $paymentWasConfirmed)) {
-            $this->commitInventoryReservations($session);
-        }
-        $this->clearCart($session);
-
-        if ($isFreeOrder) {
-            try {
-                app(FinalizeCheckoutSession::class)->finalize($session);
-            } catch (Throwable $e) {
-                Log::error('Free order fulfillment failed', [
-                    'order_id' => $order->id,
-                    'checkout_session_id' => $session->id,
-                    'error' => $e->getMessage(),
                 ]);
             }
         }
@@ -308,74 +268,6 @@ final class CreateOrderStep extends AbstractCheckoutStep
         $resolved = mb_trim((string) $value);
 
         return $resolved !== '' ? $resolved : null;
-    }
-
-    private function commitInventoryReservations(CheckoutSession $session): void
-    {
-        if (! class_exists(InventoryServiceProvider::class)) {
-            return;
-        }
-
-        $pricingData = $session->pricing_data ?? [];
-        $reservations = $pricingData['inventory_reservations'] ?? [];
-
-        if (empty($reservations)) {
-            return;
-        }
-
-        $inventoryAdapter = app(InventoryAdapter::class);
-
-        // Commit all reservations for this checkout cart at once
-        $inventoryAdapter->commitAllForReference($session->cart_id, $session->order_id);
-    }
-
-    private function shouldCommitInventoryReservations(
-        bool $isFreeOrder,
-        bool $paymentConfirmationEnabled,
-        bool $paymentWasConfirmed,
-    ): bool {
-        if ($isFreeOrder) {
-            return true;
-        }
-
-        if (! $paymentConfirmationEnabled) {
-            return true;
-        }
-
-        return $paymentWasConfirmed;
-    }
-
-    private function clearCart(CheckoutSession $session): void
-    {
-        if (! app()->bound(CartManagerInterface::class)) {
-            return;
-        }
-
-        $cartManager = app(CartManagerInterface::class);
-        $cart = $cartManager->getById($session->cart_id);
-
-        if ($cart !== null) {
-            $cart->clear();
-        }
-    }
-
-    private function redeemAppliedVouchers(CheckoutSession $session, string $orderId): void
-    {
-        if ($this->vouchersAdapter === null) {
-            return;
-        }
-
-        $discountData = $session->discount_data ?? [];
-        $voucherCodes = array_values(array_filter(array_map(
-            static fn (array $voucher): ?string => $voucher['code'] ?? null,
-            $discountData['vouchers'] ?? [],
-        )));
-
-        if ($voucherCodes === []) {
-            return;
-        }
-
-        $this->vouchersAdapter->redeemVouchers($voucherCodes, $orderId);
     }
 
     /**

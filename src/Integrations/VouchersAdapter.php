@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace AIArmada\Checkout\Integrations;
 
 use AIArmada\Cart\Cart;
+use AIArmada\Checkout\Contracts\DiscountProvider;
+use AIArmada\Checkout\Data\DiscountCommitment;
+use AIArmada\Checkout\Data\DiscountProposal;
 use AIArmada\Checkout\Models\CheckoutSession;
 use AIArmada\Checkout\Support\CheckoutCartResolver;
 use AIArmada\Vouchers\Contracts\VoucherServiceInterface;
@@ -14,7 +17,7 @@ use AIArmada\Vouchers\Events\VoucherApplied;
 use AIArmada\Vouchers\Services\VoucherDiscountCalculator;
 use Illuminate\Support\Facades\Event;
 
-final class VouchersAdapter
+final class VouchersAdapter implements DiscountProvider
 {
     public function __construct(
         private readonly ?CheckoutCartResolver $cartResolver = null,
@@ -109,15 +112,17 @@ final class VouchersAdapter
 
     /**
      * Release a voucher reservation.
+     *
+     * @param  string|null  $sessionId  When provided, only releases that session's reservation
      */
-    public function releaseVoucher(string $code): void
+    public function releaseVoucher(string $code, ?string $sessionId = null): void
     {
         if (! interface_exists(VoucherServiceInterface::class)) {
             return;
         }
 
         $voucherService = app(VoucherServiceInterface::class);
-        $voucherService->release($code);
+        $voucherService->release($code, $sessionId);
     }
 
     /**
@@ -213,5 +218,80 @@ final class VouchersAdapter
     private function discountCodeResolver(): DiscountCodeResolver
     {
         return $this->discountCodeResolver ?? app(DiscountCodeResolver::class);
+    }
+
+    public function providerKey(): string
+    {
+        return 'vouchers';
+    }
+
+    public function evaluate(CheckoutSession $session, array $discountData): array
+    {
+        $codes = $discountData['voucher_codes'] ?? [];
+        $result = $this->applyVouchers($session, $codes);
+        $proposals = [];
+
+        foreach ($result['applied'] as $applied) {
+            $proposals[] = new DiscountProposal(
+                providerKey: 'vouchers',
+                candidateKey: 'voucher:' . ($applied['code'] ?? ''),
+                requestedAmount: $applied['discount'] ?? 0,
+                label: $applied['code'] ?? null,
+                code: $applied['code'] ?? null,
+                priority: 50,
+                meta: ['voucher_id' => $applied['voucher_id'] ?? null],
+            );
+        }
+
+        return $proposals;
+    }
+
+    public function commit(CheckoutSession $session, array $accepted): array
+    {
+        $codes = [];
+
+        foreach ($accepted as $proposal) {
+            if ($proposal->code !== null) {
+                $codes[] = $proposal->code;
+            }
+        }
+
+        if ($codes === []) {
+            return [];
+        }
+
+        $this->redeemVouchers($codes, (string) ($session->order_id ?? $session->getKey()));
+
+        $commitments = [];
+        foreach ($accepted as $proposal) {
+            $key = $proposal->providerKey . ':' . $proposal->candidateKey;
+            $commitments[$key] = new DiscountCommitment(
+                providerKey: 'vouchers',
+                candidateKey: $proposal->candidateKey,
+                appliedAmount: $proposal->requestedAmount,
+                reservationToken: $proposal->code ?? $proposal->candidateKey,
+                meta: $proposal->meta,
+            );
+        }
+
+        return $commitments;
+    }
+
+    public function release(CheckoutSession $session, array $commitments): void
+    {
+        // ponytail: release clears cache reservation only; committed voucher usage
+        // is permanent and cannot be rolled back. This is intentional — voucher
+        // redemption is the point-of-no-return. If a downstream step fails after
+        // voucher commit, the voucher is consumed but order may not materialize.
+        // Add compensating redemption-reversal when loss-prevention requires it.
+        $sessionId = (string) $session->getKey();
+
+        foreach ($commitments as $commitment) {
+            $code = $commitment->reservationToken;
+
+            if ($code !== '') {
+                $this->releaseVoucher($code, $sessionId);
+            }
+        }
     }
 }

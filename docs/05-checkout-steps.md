@@ -66,11 +66,12 @@ Calculates shipping costs:
 
 ### ReserveInventoryStep
 
-Reserves inventory for items:
+Reserves inventory for items as a single group:
 
-- Creates stock reservations
-- Sets reservation expiry
-- Handles reservation failures
+- Creates a group reservation (one reference for the entire cart)
+- Stores outcome in `pricing_data.inventory_reservation` (contains `reference`, `state`, `expires_at`)
+- Sets `pricing_data.reservations_expire_at` for upstream consumers
+- Rolls back by releasing the entire reference group
 - Runs before `process_payment` by default and moves to the start of the post-payment phase when `integrations.inventory.reserve_before_payment` is `false`
 
 ### ProcessPaymentStep
@@ -194,20 +195,35 @@ class CustomValidationStep implements CheckoutStepInterface
 }
 ```
 
-### Registering Custom Steps
+### Registering Custom Steps via Contributors
 
-Register in a service provider:
+Register step factories by implementing `StepContributor` and tagging your service provider:
 
 ```php
-use AIArmada\Checkout\Contracts\CheckoutStepRegistryInterface;
+use AIArmada\Checkout\Contracts\StepContributor;
 
-public function boot(): void
+final class CustomStepContributor implements StepContributor
 {
-    $registry = app(CheckoutStepRegistryInterface::class);
-    
-    $registry->register('custom_validation', new CustomValidationStep());
+    /** @return array<string, \Closure(): CheckoutStepInterface> */
+    public function steps(): array
+    {
+        return [
+            'custom_validation' => fn (): CheckoutStepInterface => new CustomValidationStep(),
+        ];
+    }
 }
 ```
+
+Tag the contributor in your service provider:
+
+```php
+public function boot(): void
+{
+    $this->app->tag(CustomStepContributor::class, 'checkout.steps');
+}
+```
+
+The registry collects all tagged contributors during provider boot, registers their lazy factories, then freezes itself — making step resolution deterministic and safe under long-lived workers.
 
 Or via config:
 
@@ -280,12 +296,7 @@ Disable steps via config:
 ],
 ```
 
-Or programmatically:
-
-```php
-$registry = app(CheckoutStepRegistryInterface::class);
-$registry->disable('reserve_inventory');
-```
+Or by tagging a `StepContributor` that does not register disabled steps.
 
 ## Reordering Steps
 
@@ -302,16 +313,7 @@ Change execution order via config:
 ],
 ```
 
-Or programmatically:
-
-```php
-$registry->setOrder([
-    'validate_cart',
-    'calculate_tax',
-    'calculate_pricing',
-    // ...
-]);
-```
+Config-driven ordering is applied during provider boot before the registry freezes. Order configuration is the preferred reordering mechanism.
 
 ## Step Events
 
@@ -335,18 +337,10 @@ Event::listen(CheckoutStepCompleted::class, function ($event) {
 });
 ```
 
-## Pipeline Runner
+## Step Executor
 
-The step loop is extracted into `RunCheckoutPipeline`, which owns step iteration, skip rules, redirect exits, and failure exits. Both `CheckoutService::processCheckout()` and `ContinueFromStep()` delegate to this shared runner instead of duplicating the loop.
+The step loop lives in `StepExecutor`, which owns step iteration, skip rules, redirect exits, failure exits, and dependency validation. Both `CheckoutService::processCheckout()` and retry/continue paths delegate to this shared executor.
 
 ## Step Order Policy
 
-Step ordering helpers (`resolveInventoryStepOrder`, `enforceStepDependencyOrder`) are isolated in `CheckoutStepOrderPolicy`, keeping ordering logic out of the service provider.
-
-```php
-use AIArmada\Checkout\Support\CheckoutStepOrderPolicy;
-
-$policy = app(CheckoutStepOrderPolicy::class);
-$normalizedOrder = $policy->normalizeInventoryStepOrder($registry, $registry->getOrder());
-$registry->setOrder($normalizedOrder);
-```
+Step ordering helpers (`resolveInventoryStepOrder`, `enforceStepDependencyOrder`) are isolated in `CheckoutStepOrderPolicy`. The policy is applied during provider boot before the registry freezes, ensuring order is configured once and immutable at runtime.

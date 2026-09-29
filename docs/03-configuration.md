@@ -101,21 +101,6 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Stored Checkout Actor
-    |--------------------------------------------------------------------------
-    |
-    | PersistCustomerStep can resume the authenticated actor stored during
-    | resolve_customer. Only the model classes listed here — plus the auth
-    | provider models and the checkout customer model, which are always
-    | allowed — may be resolved from that stored reference.
-    |
-    */
-    'checkout_actor' => [
-        'allowed_types' => [],
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
     | Integrations
     |--------------------------------------------------------------------------
     */
@@ -183,6 +168,18 @@ return [
         ],
     ],
 
+    'response_mode' => 'redirect',
+
+    'views' => [
+        'enabled' => true,
+        'layout' => 'layouts.app',
+        'routes' => [
+            'success' => 'checkout::success',
+            'failure' => 'checkout::failure',
+            'cancel' => 'checkout::cancel',
+        ],
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | Routes
@@ -239,18 +236,6 @@ return [
         'cancel' => env('CHECKOUT_REDIRECT_CANCEL', '/checkout/cancelled'),
     ],
 
-    'response_mode' => 'redirect',
-
-    'views' => [
-        'enabled' => true,
-        'layout' => 'layouts.app',
-        'routes' => [
-            'success' => 'checkout::success',
-            'failure' => 'checkout::failure',
-            'cancel' => 'checkout::cancel',
-        ],
-    ],
-
     /*
     |--------------------------------------------------------------------------
     | Webhook Verification
@@ -290,8 +275,8 @@ Checkout document generation is disabled by default. The `dispatch_documents` st
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `database.table_prefix` | string | `''` | Prefix for database tables |
-| `database.json_column_type` | string | `jsonb` | JSON column type used by the checkout migrations |
 | `database.tables.checkout_sessions` | string | `checkout_sessions` | Sessions table name |
+| — | — | — | JSON column type via `commerce_json_column_type('checkout', 'jsonb')` helper |
 
 ### Default Settings
 
@@ -360,7 +345,7 @@ Checkout validates core step invariants during provider boot.
 |-----|------|---------|-------------|
 | `payment.default_gateway` | string | `chip` | Default payment gateway |
 | `payment.gateway_priority` | array | `['chip', 'cashier-chip', 'cashier']` | Gateway resolution order |
-| `payment.prefer_actor` | bool | `false` | Forwarded as `prefer_actor` metadata to the billable-subject resolver during `resolve_customer` |
+| `payment.prefer_actor` | bool | `false` | Prefer the authenticated actor during customer resolution |
 | `payment.retry_limit` | int | `3` | Max payment retry attempts |
 | `payment.callback_token_ttl` | int | `86400` | Callback-token lifetime in seconds; provider validation caps it at 24 hours |
 | `payment.callback_rate_limit.max_attempts` | int | `10` | Callback attempts allowed per session during the decay window |
@@ -380,7 +365,7 @@ owned by checkout:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `create_order.confirm_payment` | bool | `true` | Triggers the order payment-confirmed transition immediately after checkout creates the order |
+| `create_order.confirm_payment` | bool | `true` | Triggers the order payment-confirmed transition immediately after checkout creates the order. Free orders are always confirmed (there is no payment to verify and no operator-facing zero-amount path — only the `confirmFreeOrder` service API) |
 
 ### Routes
 
@@ -503,6 +488,7 @@ CHECKOUT_JSON_COLUMN_TYPE=jsonb
 
 # Payment gateway
 CHECKOUT_DEFAULT_GATEWAY=chip
+CHECKOUT_PREFER_ACTOR=false
 CHECKOUT_STRIPE_WEBHOOK_SECRET=
 
 # Routes

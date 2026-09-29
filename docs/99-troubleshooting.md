@@ -217,6 +217,10 @@ app(PaymentGatewayResolverInterface::class)
     ->register('mock', $mock);
 ```
 
+`PaymentProcessorInterface` also requires `handleCallback()`, `getRedirectUrl()`,
+`refund()`, and `checkStatus()`; stub them too if the mock is type-checked against
+the full interface.
+
 ### Test Checkout Flow
 
 ```php

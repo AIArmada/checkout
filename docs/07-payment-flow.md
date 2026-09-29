@@ -166,7 +166,7 @@ if ($result->success) {
 When payment fails at the gateway:
 
 1. The callback resolves and token-validates the checkout session inside the same transaction-safe path as success callbacks
-2. Failure handling only runs when the session is still in a pending-like state (`Pending`, `AwaitingPayment`, `PaymentProcessing`, `Processing`, or `PaymentFailed`)
+2. Failure handling only runs while the session is in a payment state (`AwaitingPayment`, `PaymentProcessing`, `Processing`, `PaymentFailed`) or still `Pending`
 3. Already-completed sessions short-circuit to the success response instead of mutating the session backward
 4. The user is redirected to the failure URL and the error message is flashed to session
 
@@ -183,7 +183,7 @@ if ($session->status->canRetryPayment()) {
 When user cancels at the gateway:
 
 1. The callback uses the same transaction + token validation path as success and failure
-2. Cancellation is only processed while the session is still pending-like
+2. Cancellation is only processed while the session is in a payment state or still `Pending`
 3. Completed sessions short-circuit to the success response
 4. Otherwise the user is redirected to the cancel URL and the session ID/message are flashed
 
@@ -305,7 +305,7 @@ Processing ─────────────▶ AwaitingPayment ◀──�
 
 ## Post-Payment Phase Steps
 
-After payment confirmation, the checkout step runs these irreversible operations in order:
+After payment confirmation, `CheckoutFinalizer::finalize()` runs:
 
 1. Persist `order_id` on the session (before payment confirmation, so retries reuse the same order)
 2. Confirm payment on the order when `create_order.confirm_payment` is enabled (paid orders only)

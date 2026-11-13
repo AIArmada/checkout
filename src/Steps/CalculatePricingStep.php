@@ -6,9 +6,8 @@ namespace AIArmada\Checkout\Steps;
 
 use AIArmada\Checkout\Data\StepResult;
 use AIArmada\Checkout\Models\CheckoutSession;
-use AIArmada\Pricing\Contracts\Priceable;
+use AIArmada\CommerceSupport\Contracts\Priceable;
 use AIArmada\Pricing\Contracts\PriceCalculatorInterface;
-use AIArmada\Pricing\PricingServiceProvider;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Model;
 
@@ -48,7 +47,7 @@ final class CalculatePricingStep extends AbstractCheckoutStep
             $itemPrice = $item['price'] ?? 0;
             $quantity = $item['quantity'] ?? 1;
             $lineTotal = $itemPrice * $quantity;
-            $productId = $item['product_id'] ?? data_get($item, 'attributes.product_id');
+            $productId = data_get($item, 'attributes.product_id');
 
             $pricingData['items'][] = [
                 'item_id' => $item['id'] ?? null,
@@ -62,7 +61,7 @@ final class CalculatePricingStep extends AbstractCheckoutStep
         }
 
         // Apply any pricing rules if pricing package is available
-        if ($this->hasPricingPackage()) {
+        if (app()->bound(PriceCalculatorInterface::class)) {
             $pricingData = $this->applyPricingRules($session, $pricingData, $subtotal);
             $subtotal = $pricingData['subtotal'] ?? $subtotal;
         }
@@ -83,23 +82,12 @@ final class CalculatePricingStep extends AbstractCheckoutStep
         ]);
     }
 
-    private function hasPricingPackage(): bool
-    {
-        return class_exists(PricingServiceProvider::class);
-    }
-
     /**
      * @param  array<string, mixed>  $pricingData
      * @return array<string, mixed>
      */
     private function applyPricingRules(CheckoutSession $session, array $pricingData, int $subtotal): array
     {
-        if (! interface_exists(PriceCalculatorInterface::class)) {
-            $pricingData['subtotal'] = $subtotal;
-
-            return $pricingData;
-        }
-
         $calculator = app(PriceCalculatorInterface::class);
 
         $cartSnapshot = $session->cart_snapshot ?? [];
@@ -112,7 +100,7 @@ final class CalculatePricingStep extends AbstractCheckoutStep
         foreach ($items as $index => $item) {
             $quantity = (int) ($item['quantity'] ?? 1);
             $unitPrice = (int) ($item['price'] ?? 0);
-            $productId = $item['product_id'] ?? data_get($item, 'attributes.product_id');
+            $productId = data_get($item, 'attributes.product_id');
 
             $originalUnitPrice = null;
             $discountAmount = 0;

@@ -9,7 +9,10 @@ use AIArmada\Checkout\Data\StepResult;
 use AIArmada\Checkout\Exceptions\InventoryException;
 use AIArmada\Checkout\Integrations\InventoryAdapter;
 use AIArmada\Checkout\Models\CheckoutSession;
+use AIArmada\Checkout\Support\CompositeCartRevalidator;
 use AIArmada\Inventory\Data\ReservationLine;
+use AIArmada\Inventory\Exceptions\InsufficientInventoryException;
+use AIArmada\Orders\Support\CartLineSnapshot;
 use Carbon\CarbonImmutable;
 use Throwable;
 
@@ -94,30 +97,53 @@ final class ReserveInventoryStep extends AbstractCheckoutStep
         $cartSnapshot = $session->cart_snapshot ?? [];
         $items = $cartSnapshot['items'] ?? [];
         $reservationTtl = config('checkout.integrations.inventory.reservation_ttl', 900);
-        $reference = $session->cart_id;
+        $reference = CompositeCartRevalidator::supports($session) ? (string) $session->getKey() : $session->cart_id;
 
         try {
             $lines = [];
 
             foreach ($items as $item) {
-                $productId = $item['product_id'] ?? data_get($item, 'attributes.product_id');
-                $variantId = $item['variant_id'] ?? data_get($item, 'attributes.variant_id');
-                $inventoryableType = data_get($item, 'inventoryable_type')
-                    ?? data_get($item, 'attributes.inventoryable_type');
-                $inventoryableId = data_get($item, 'inventoryable_id')
-                    ?? data_get($item, 'attributes.inventoryable_id');
-                $quantity = $item['quantity'] ?? 1;
-
-                $productId ??= $inventoryableId;
-
-                if ($productId === null) {
+                if (! is_array($item)) {
                     continue;
                 }
 
+                $line = CartLineSnapshot::fromArray($item);
+
+                if ($line->hasComponents()) {
+                    // The composite parent is commercial identity only. Only
+                    // actual component inventory is reserved, and each package
+                    // quantity multiplies its per-package component quantity.
+                    foreach ($line->expandedComponents() as $component) {
+                        if (! $component['tracks_inventory']) {
+                            continue;
+                        }
+
+                        $lines[] = new ReservationLine(
+                            productId: $component['product_id'],
+                            variantId: $component['variant_id'],
+                            quantity: $component['quantity'],
+                            inventoryableType: $component['inventoryable_type'],
+                            inventoryableId: $component['inventoryable_id'],
+                        );
+                    }
+
+                    continue;
+                }
+
+                if ($line->purchasableId === null) {
+                    continue;
+                }
+
+                $attributes = is_array($item['attributes'] ?? null) ? $item['attributes'] : [];
+                $inventoryableType = $attributes['inventoryable_type'] ?? null;
+                $inventoryableId = $attributes['inventoryable_id'] ?? null;
+
                 $lines[] = new ReservationLine(
-                    productId: (string) $productId,
-                    variantId: is_string($variantId) ? $variantId : null,
-                    quantity: (int) $quantity,
+                    productId: $line->productId
+                        ?? (is_string($inventoryableId) || is_int($inventoryableId) ? (string) $inventoryableId : null)
+                        ?? $line->purchasableId,
+                    variantId: $line->variantId,
+                    quantity: $line->quantity,
                     inventoryableType: is_string($inventoryableType) ? $inventoryableType : null,
                     inventoryableId: is_string($inventoryableId) || is_int($inventoryableId)
                         ? (string) $inventoryableId
@@ -149,6 +175,13 @@ final class ReserveInventoryStep extends AbstractCheckoutStep
                 'reference' => $outcome->reference,
                 'state' => $outcome->state,
                 'expires_in' => $reservationTtl,
+            ]);
+        } catch (InsufficientInventoryException $e) {
+            // A short component is a shopper-facing stock change, not an
+            // infrastructure fault: fail the step so compensation releases the
+            // partial reservation and the shopper can review the cart.
+            return $this->failed('The selected quantity is no longer available.', [
+                'inventory' => $e->getMessage(),
             ]);
         } catch (Throwable $e) {
             throw InventoryException::reservationFailed(

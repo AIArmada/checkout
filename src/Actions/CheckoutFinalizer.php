@@ -5,12 +5,15 @@ declare(strict_types=1);
 namespace AIArmada\Checkout\Actions;
 
 use AIArmada\Cart\Contracts\CartManagerInterface;
+use AIArmada\Cart\Storage\CartRevision;
 use AIArmada\Checkout\Data\CheckoutResult;
 use AIArmada\Checkout\Events\CheckoutCompleted;
 use AIArmada\Checkout\Models\CheckoutSession;
 use AIArmada\Checkout\States\Completed;
 use AIArmada\Checkout\States\Processing;
+use AIArmada\Checkout\Support\CompositeCartRevalidator;
 use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Support\Facades\DB;
 use Throwable;
 
 final class CheckoutFinalizer
@@ -34,12 +37,23 @@ final class CheckoutFinalizer
 
         $this->events->dispatch(new CheckoutCompleted($session));
 
-        $this->clearCart($session);
+        // Clear the cart only once checkout completion is durable.
+        $cartId = $session->getAttribute('cart_id');
+
+        if (is_string($cartId) && $cartId !== '') {
+            $version = $session->cart_snapshot['version'] ?? null;
+            if (! CompositeCartRevalidator::supports($session)) {
+                DB::afterCommit(fn () => $this->clearCart($cartId, null));
+            } elseif (is_int($version)) {
+                $revision = CartRevision::of($cartId, $version);
+                DB::afterCommit(fn () => $this->clearCart($cartId, $revision));
+            }
+        }
 
         return CheckoutResult::success($session);
     }
 
-    private function clearCart(CheckoutSession $session): void
+    private function clearCart(string $cartId, ?CartRevision $revision): void
     {
         $cartManager = $this->cartManager;
 
@@ -58,14 +72,12 @@ final class CheckoutFinalizer
         }
 
         try {
-            $cartId = $session->getAttribute('cart_id');
+            $cart = $cartManager->getById($cartId);
 
-            if ($cartId !== null) {
-                $cart = $cartManager->getById($cartId);
-
-                if ($cart !== null) {
-                    $cart->clear();
-                }
+            if ($revision !== null) {
+                $cart?->clearIfUnchanged($revision);
+            } else {
+                $cart?->clear();
             }
         } catch (Throwable) {
             // ponytail: cart clearing failures don't roll back completed checkout

@@ -8,9 +8,11 @@ use AIArmada\Checkout\Data\StepResult;
 use AIArmada\Checkout\Enums\PaymentStatus;
 use AIArmada\Checkout\Models\CheckoutSession;
 use AIArmada\Checkout\Support\CheckoutCartResolver;
+use AIArmada\Checkout\Support\CompositeCartRevalidator;
 use AIArmada\Orders\Contracts\OrderServiceInterface;
 use AIArmada\Orders\Exceptions\OrderNotAwaitingPayment;
 use AIArmada\Orders\Models\Order;
+use AIArmada\Orders\Support\CartLineSnapshot;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Log;
@@ -78,7 +80,12 @@ final class CreateOrderStep extends AbstractCheckoutStep
             $shippingData = $session->shipping_data ?? [];
             $billingData = $session->billing_data ?? [];
 
-            $liveCart = app(CheckoutCartResolver::class)->resolveLiveCart($session);
+            // A composite checkout is sold from its frozen snapshot. Re-reading
+            // the live cart here could swap the reviewed composition or price
+            // after payment has already been taken.
+            $liveCart = CompositeCartRevalidator::supports($session)
+                ? null
+                : app(CheckoutCartResolver::class)->resolveLiveCart($session);
 
             if ($liveCart !== null) {
                 if (! $customer instanceof Model) {
@@ -95,19 +102,21 @@ final class CreateOrderStep extends AbstractCheckoutStep
                     sessionId: $session->id,
                 );
             } else {
+                $items = $this->buildOrderItems($session);
+                $lineDiscounts = array_sum(array_column($items, 'discount_amount'));
+                $pricingDiscount = max(0, $lineDiscounts - $session->discount_total);
+
                 $orderData = [
                     'customer_id' => $customer?->getKey(),
                     'customer_type' => $customer?->getMorphClass(),
-                    'subtotal' => $session->subtotal,
-                    'discount_total' => $session->discount_total,
+                    'subtotal' => $session->subtotal + $pricingDiscount,
+                    'discount_total' => $session->discount_total + $pricingDiscount,
                     'shipping_total' => $session->shipping_total,
                     'tax_total' => $session->tax_total,
                     'grand_total' => $session->grand_total,
                     'currency' => $session->currency,
                     'metadata' => $this->buildOrderMetadata($session, $paymentData),
                 ];
-
-                $items = $this->buildOrderItems($session);
 
                 $order = $orderService->createOrder(
                     orderData: $orderData,
@@ -201,12 +210,18 @@ final class CreateOrderStep extends AbstractCheckoutStep
         $pricingByItemId = $this->pricingItemsById($pricingItems);
 
         $lineBases = [];
+        $lines = [];
 
         foreach ($cartItems as $index => $cartItem) {
-            $pricingItem = $this->pricingItemForCartItem($cartItem, $index, $pricingItems, $pricingByItemId);
-            $quantity = max(1, (int) ($pricingItem['quantity'] ?? $cartItem['quantity'] ?? 1));
-            $baseUnitPrice = (int) ($pricingItem['original_unit_price'] ?? $pricingItem['unit_price'] ?? $cartItem['price'] ?? $cartItem['unit_price'] ?? 0);
+            $pricingItem = $pricingByItemId[(string) ($cartItem['id'] ?? '')] ?? [];
+            $line = CartLineSnapshot::fromArray($cartItem);
+            $quantity = max(1, (int) ($pricingItem['quantity'] ?? $line->quantity));
+            $baseUnitPrice = max(
+                (int) ($pricingItem['unit_price'] ?? $line->unitPrice),
+                (int) ($pricingItem['original_unit_price'] ?? 0),
+            );
 
+            $lines[$index] = $line;
             $lineBases[$index] = $baseUnitPrice * $quantity;
         }
 
@@ -215,61 +230,50 @@ final class CreateOrderStep extends AbstractCheckoutStep
         $taxBases = [];
 
         foreach ($cartItems as $index => $cartItem) {
-            $pricingItem = $this->pricingItemForCartItem($cartItem, $index, $pricingItems, $pricingByItemId);
-            $quantity = max(1, (int) ($pricingItem['quantity'] ?? $cartItem['quantity'] ?? 1));
-            $baseUnitPrice = (int) ($pricingItem['original_unit_price'] ?? $pricingItem['unit_price'] ?? $cartItem['price'] ?? $cartItem['unit_price'] ?? 0);
-            $finalUnitPrice = (int) ($pricingItem['unit_price'] ?? $cartItem['price'] ?? $cartItem['unit_price'] ?? $baseUnitPrice);
+            $pricingItem = $pricingByItemId[(string) ($cartItem['id'] ?? '')] ?? [];
+            $line = $lines[$index];
+            $quantity = max(1, (int) ($pricingItem['quantity'] ?? $line->quantity));
+            $finalUnitPrice = (int) ($pricingItem['unit_price'] ?? $line->unitPrice);
+            $baseUnitPrice = max($finalUnitPrice, (int) ($pricingItem['original_unit_price'] ?? $finalUnitPrice));
             $pricingDiscount = max(0, ($baseUnitPrice - $finalUnitPrice) * $quantity);
 
-            $taxBases[$index] = max(0, ($lineBases[$index] ?? 0) - $pricingDiscount - ($checkoutDiscountAllocations[$index] ?? 0));
+            $taxBases[$index] = $line->isTaxable
+                ? max(0, ($lineBases[$index] ?? 0) - $pricingDiscount - ($checkoutDiscountAllocations[$index] ?? 0))
+                : 0;
         }
 
         $taxAllocations = $this->allocateAmount((int) $session->tax_total, $taxBases);
 
-        return array_map(function (array $cartItem, int $index) use ($pricingItems, $pricingByItemId, $checkoutDiscountAllocations, $taxAllocations): array {
-            $pricingItem = $this->pricingItemForCartItem($cartItem, $index, $pricingItems, $pricingByItemId);
-            $quantity = max(1, (int) ($pricingItem['quantity'] ?? $cartItem['quantity'] ?? 1));
-            $baseUnitPrice = (int) ($pricingItem['original_unit_price'] ?? $pricingItem['unit_price'] ?? $cartItem['price'] ?? $cartItem['unit_price'] ?? 0);
-            $finalUnitPrice = (int) ($pricingItem['unit_price'] ?? $cartItem['price'] ?? $cartItem['unit_price'] ?? $baseUnitPrice);
+        return array_map(function (array $cartItem, int $index) use ($session, $pricingByItemId, $lines, $checkoutDiscountAllocations, $taxAllocations): array {
+            $pricingItem = $pricingByItemId[(string) ($cartItem['id'] ?? '')] ?? [];
+            $line = $lines[$index];
+            $quantity = max(1, (int) ($pricingItem['quantity'] ?? $line->quantity));
+            $finalUnitPrice = (int) ($pricingItem['unit_price'] ?? $line->unitPrice);
+            $baseUnitPrice = max($finalUnitPrice, (int) ($pricingItem['original_unit_price'] ?? $finalUnitPrice));
             $pricingDiscount = max(0, ($baseUnitPrice - $finalUnitPrice) * $quantity);
-            $associatedModel = $cartItem['associated_model'] ?? null;
-            $attributes = is_array($cartItem['attributes'] ?? null) ? $cartItem['attributes'] : [];
-            $purchasableId = $cartItem['purchasable_id']
-                ?? $attributes['purchasable_id']
-                ?? $cartItem['product_id']
-                ?? $attributes['product_id']
-                ?? (is_array($associatedModel) ? $associatedModel['id'] ?? null : null);
-            $purchasableType = $cartItem['purchasable_type']
-                ?? $attributes['purchasable_type']
-                ?? (is_array($associatedModel) ? $associatedModel['class'] ?? null : null);
-            $sku = $cartItem['sku']
-                ?? $attributes['sku']
-                ?? (is_array($associatedModel) ? data_get($associatedModel, 'data.sku') : null);
-            $currency = $cartItem['currency'] ?? $attributes['currency'] ?? null;
+            $metadata = is_array($cartItem['metadata'] ?? null) ? $cartItem['metadata'] : [];
 
             return [
-                'purchasable_id' => $purchasableId,
-                'purchasable_type' => $purchasableType,
-                'name' => $cartItem['name'] ?? '',
-                'sku' => $sku,
+                'purchasable_id' => $line->purchasableId,
+                'purchasable_type' => $line->purchasableType,
+                'name' => $cartItem['name'] ?? $line->name,
+                'sku' => $line->sku,
                 'quantity' => $quantity,
                 'unit_price' => $baseUnitPrice,
                 'discount_amount' => $pricingDiscount + ($checkoutDiscountAllocations[$index] ?? 0),
                 'tax_amount' => $taxAllocations[$index] ?? 0,
-                'currency' => $currency,
-                'options' => $cartItem['attributes'] ?? $cartItem['options'] ?? null,
-                'metadata' => array_merge(
-                    $cartItem['metadata'] ?? [],
+                'currency' => $line->currency ?? $session->currency,
+                'options' => $line->attributes !== [] ? $line->attributes : ($cartItem['options'] ?? null),
+                'metadata' => $line->orderItemMetadata(array_merge(
+                    $metadata,
                     ['pricing_breakdown' => $pricingItem['pricing_breakdown'] ?? []],
-                ),
+                )),
             ];
         }, $cartItems, array_keys($cartItems));
     }
 
     /**
-     * Join pricing rows to cart lines by item id so a reordered or filtered
-     * pricing set cannot misprice lines. Lines without ids keep the legacy
-     * positional join, which is the only option when no keys exist.
+     * Join pricing rows to cart lines by item ID.
      *
      * @param  array<int, mixed>  $pricingItems
      * @return array<string, array<string, mixed>>
@@ -291,30 +295,6 @@ final class CreateOrderStep extends AbstractCheckoutStep
         }
 
         return $byId;
-    }
-
-    /**
-     * @param  array<int, mixed>  $pricingItems
-     * @param  array<string, array<string, mixed>>  $pricingByItemId
-     * @return array<string, mixed>
-     */
-    private function pricingItemForCartItem(
-        mixed $cartItem,
-        int $index,
-        array $pricingItems,
-        array $pricingByItemId,
-    ): array {
-        $itemId = is_array($cartItem) ? ($cartItem['id'] ?? null) : null;
-
-        if ((is_string($itemId) || is_int($itemId)) && (string) $itemId !== ''
-            && isset($pricingByItemId[(string) $itemId])
-        ) {
-            return $pricingByItemId[(string) $itemId];
-        }
-
-        $fallback = $pricingItems[$index] ?? [];
-
-        return is_array($fallback) ? $fallback : [];
     }
 
     /**
@@ -341,6 +321,11 @@ final class CreateOrderStep extends AbstractCheckoutStep
         ];
 
         $cartMetadata = data_get($session->cart_snapshot, 'metadata');
+
+        $reservationReference = data_get($session->pricing_data, 'inventory_reservation.reference');
+        if (is_string($reservationReference)) {
+            $metadata['inventory_reservation_reference'] = $reservationReference;
+        }
 
         if (! is_array($cartMetadata)) {
             return $metadata;
